@@ -53,6 +53,7 @@
 #include <termios.h> // POSIX terminal control definitions - tcgetattr(), tcsetattr()
 #include <pthread.h> // POSIX threads management (inputs reading)
 #include <dirent.h>  // POSIX directory browsing
+#include <errno.h>
 
 #include <sys/ioctl.h>      // Required for: ioctl() - UNIX System call for device-specific input/output operations
 #include <linux/kd.h>       // Linux: KDSKBMODE, K_MEDIUMRAM constants definition
@@ -67,6 +68,7 @@
 #include <gbm.h>            // Generic Buffer Management (native platform for EGL on DRM)
 #include <xf86drm.h>        // Direct Rendering Manager user-level library interface
 #include <xf86drmMode.h>    // Direct Rendering Manager mode setting (KMS) interface
+#include <drm_fourcc.h>
 
 #include "EGL/egl.h"        // Native platform windowing system interface
 #include "EGL/eglext.h"     // EGL extensions
@@ -552,9 +554,27 @@ void SwapScreenBuffer(void)
     if (!bo) TRACELOG(LOG_ERROR, "DISPLAY: Failed GBM to lock front buffer");
 
     uint32_t fb = 0;
-    int result = drmModeAddFB(platform.fd, platform.connector->modes[platform.modeIndex].hdisplay, platform.connector->modes[platform.modeIndex].vdisplay, 24, 32, gbm_bo_get_stride(bo), gbm_bo_get_handle(bo).u32, &fb);
-    if (result != 0) TRACELOG(LOG_ERROR, "DISPLAY: drmModeAddFB() failed with result: %d", result);
-
+     uint32_t handles[4] = { gbm_bo_get_handle(bo).u32, 0, 0, 0 };
+     uint32_t pitches[4] = { (uint32_t)gbm_bo_get_stride(bo), 0, 0, 0 };
+     uint32_t offsets[4] = { 0, 0, 0, 0 };
+ 
+     int result = drmModeAddFB2(platform.fd,
+         platform.connector->modes[platform.modeIndex].hdisplay,
+         platform.connector->modes[platform.modeIndex].vdisplay,
+         DRM_FORMAT_ARGB8888,
+         handles, pitches, offsets,
+        &fb, 0);
+    if (result == -EINVAL) {
+       TRACELOG(LOG_WARNING, "DISPLAY: ARGB8888 rejected, retrying XRGB8888");
+        result = drmModeAddFB2(platform.fd,
+            platform.connector->modes[platform.modeIndex].hdisplay,
+            platform.connector->modes[platform.modeIndex].vdisplay,
+            DRM_FORMAT_XRGB8888,
+            handles, pitches, offsets,
+            &fb, 0);
+    }
+    if (result != 0) TRACELOG(LOG_ERROR, "DISPLAY: drmModeAddFB2() failed with result: %d", result);
+    
     result = drmModeSetCrtc(platform.fd, platform.crtc->crtc_id, fb, 0, 0, &platform.connector->connector_id, 1, &platform.connector->modes[platform.modeIndex]);
     if (result != 0) TRACELOG(LOG_ERROR, "DISPLAY: drmModeSetCrtc() failed with result: %d", result);
 
