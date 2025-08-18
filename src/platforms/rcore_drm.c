@@ -237,6 +237,8 @@ static void PollMouseEvents(void);              // Process evdev mouse events
 static int FindMatchingConnectorMode(const drmModeConnector *connector, const drmModeModeInfo *mode);                               // Search matching DRM mode in connector's mode list
 static int FindExactConnectorMode(const drmModeConnector *connector, uint width, uint height, uint fps, bool allowInterlaced);      // Search exactly matching DRM connector mode in connector's list
 static int FindNearestConnectorMode(const drmModeConnector *connector, uint width, uint height, uint fps, bool allowInterlaced);    // Search the nearest matching DRM connector mode in connector's list
+static int FindPreferredConnectorMode(const drmModeConnector *connector);                                                           // Prefer EDID "preferred" mode
+static int FindExactSizeConnectorMode(const drmModeConnector *connector, uint width, uint height, bool allowInterlaced);            // Exact WxH ignoring fps
 
 //----------------------------------------------------------------------------------
 // Module Functions Declaration
@@ -823,30 +825,42 @@ int InitPlatform(void)
         return -1;
     }
 
-    // If InitWindow should use the current mode find it in the connector's mode list
-    if ((CORE.Window.screen.width <= 0) || (CORE.Window.screen.height <= 0))
-    {
-        TRACELOG(LOG_TRACE, "DISPLAY: Selecting DRM connector mode for current used mode...");
-
-        platform.modeIndex = FindMatchingConnectorMode(platform.connector, &platform.crtc->mode);
-
-        if (platform.modeIndex < 0)
-        {
-            TRACELOG(LOG_WARNING, "DISPLAY: No matching DRM connector mode found");
-            drmModeFreeEncoder(enc);
-            drmModeFreeResources(res);
-            return -1;
+    // If InitWindow(0,0), prefer EDID "preferred" mode; fallback to matching current CRTC
+    if ((CORE.Window.screen.width <= 0) || (CORE.Window.screen.height <= 0)) {
+        int preferred = FindPreferredConnectorMode(platform.connector);
+        if (preferred >= 0) {
+            TRACELOG(LOG_INFO, "DISPLAY: Using EDID preferred mode index %d (%ux%u@%u%s)",
+                preferred,
+                platform.connector->modes[preferred].hdisplay,
+                platform.connector->modes[preferred].vdisplay,
+                platform.connector->modes[preferred].vrefresh,
+                (platform.connector->modes[preferred].flags & DRM_MODE_FLAG_INTERLACE)? "i" : "p");
+            platform.modeIndex = preferred;
+            CORE.Window.screen.width  = platform.connector->modes[preferred].hdisplay;
+            CORE.Window.screen.height = platform.connector->modes[preferred].vdisplay;
+        } else {
+            TRACELOG(LOG_TRACE, "DISPLAY: Selecting DRM connector mode for current used mode...");
+            platform.modeIndex = FindMatchingConnectorMode(platform.connector, &platform.crtc->mode);
+            if (platform.modeIndex < 0) {
+                TRACELOG(LOG_WARNING, "DISPLAY: No matching DRM connector mode found");
+                drmModeFreeEncoder(enc);
+                drmModeFreeResources(res);
+                return -1;
+            }
+            CORE.Window.screen.width  = platform.crtc->mode.hdisplay;
+            CORE.Window.screen.height = platform.crtc->mode.vdisplay;
         }
-
-        CORE.Window.screen.width = CORE.Window.display.width;
-        CORE.Window.screen.height = CORE.Window.display.height;
     }
 
     const bool allowInterlaced = CORE.Window.flags & FLAG_INTERLACED_HINT;
     const int fps = (CORE.Time.target > 0)? (1.0/CORE.Time.target) : 60;
 
     // Try to find an exact matching mode
-    platform.modeIndex = FindExactConnectorMode(platform.connector, CORE.Window.screen.width, CORE.Window.screen.height, fps, allowInterlaced);
+
+    // First: exact size (WxH) ignoring fps (handles 59.94 vs 60 neatly)
+    platform.modeIndex = FindExactSizeConnectorMode(platform.connector, CORE.Window.screen.width, CORE.Window.screen.height, allowInterlaced);
+    // Then: exact WxH@fps if still not found
+    if (platform.modeIndex < 0) platform.modeIndex = FindExactConnectorMode(platform.connector, CORE.Window.screen.width, CORE.Window.screen.height, fps, allowInterlaced);
 
     // If nothing found, try to find a nearly matching mode
     if (platform.modeIndex < 0) platform.modeIndex = FindNearestConnectorMode(platform.connector, CORE.Window.screen.width, CORE.Window.screen.height, fps, allowInterlaced);
@@ -1957,6 +1971,35 @@ static int FindNearestConnectorMode(const drmModeConnector *connector, uint widt
     }
 
     return nearestIndex;
+}
+
+// Prefer EDID "preferred" mode if advertised by the connector
+static int FindPreferredConnectorMode(const drmModeConnector *connector)
+{
+    if (connector == NULL) return -1;
+    for (int i = 0; i < connector->count_modes; i++) {
+        if (connector->modes[i].type & DRM_MODE_TYPE_PREFERRED) return i;
+    }
+    return -1;
+}
+
+// Match exact resolution (width x height), ignoring fps; respect interlace hint
+static int FindExactSizeConnectorMode(const drmModeConnector *connector, uint width, uint height, bool allowInterlaced)
+{
+    if (connector == NULL) return -1;
+    for (int i = 0; i < connector->count_modes; i++) {
+        const drmModeModeInfo *const mode = &connector->modes[i];
+        if ((mode->hdisplay == width) && (mode->vdisplay == height)) {
+            if (!allowInterlaced && (mode->flags & DRM_MODE_FLAG_INTERLACE)) continue;
+            return i;
+        }
+    }
+    // As a last resort, accept interlaced for exact WxH if caller didn’t allow it but nothing else matched
+    for (int i = 0; i < connector->count_modes; i++) {
+        const drmModeModeInfo *const mode = &connector->modes[i];
+        if ((mode->hdisplay == width) && (mode->vdisplay == height)) return i;
+    }
+    return -1;
 }
 
 // EOF
