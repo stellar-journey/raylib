@@ -53,6 +53,7 @@
 #include <termios.h> // POSIX terminal control definitions - tcgetattr(), tcsetattr()
 #include <pthread.h> // POSIX threads management (inputs reading)
 #include <dirent.h>  // POSIX directory browsing
+#include <poll.h>    // poll() for non-blocking DRM event handling
 #include <errno.h>
 
 #include <sys/ioctl.h>      // Required for: ioctl() - UNIX System call for device-specific input/output operations
@@ -550,24 +551,26 @@ void SwapScreenBuffer(void)
 {
     eglSwapBuffers(platform.device, platform.surface);
 
-    if (!platform.gbmSurface || (-1 == platform.fd) || !platform.connector || !platform.crtc) TRACELOG(LOG_ERROR, "DISPLAY: DRM initialization failed to swap");
+    if (!platform.gbmSurface || (-1 == platform.fd) || !platform.connector || !platform.crtc)
+        TRACELOG(LOG_ERROR, "DISPLAY: DRM initialization failed to swap");
 
     struct gbm_bo *bo = gbm_surface_lock_front_buffer(platform.gbmSurface);
     if (!bo) TRACELOG(LOG_ERROR, "DISPLAY: Failed GBM to lock front buffer");
 
     uint32_t fb = 0;
-     uint32_t handles[4] = { gbm_bo_get_handle(bo).u32, 0, 0, 0 };
-     uint32_t pitches[4] = { (uint32_t)gbm_bo_get_stride(bo), 0, 0, 0 };
-     uint32_t offsets[4] = { 0, 0, 0, 0 };
- 
-     int result = drmModeAddFB2(platform.fd,
-         platform.connector->modes[platform.modeIndex].hdisplay,
-         platform.connector->modes[platform.modeIndex].vdisplay,
-         DRM_FORMAT_ARGB8888,
-         handles, pitches, offsets,
+    // If your tree still has drmModeAddFB here, ensure 0001 applies before this patch.
+    uint32_t handles[4] = { gbm_bo_get_handle(bo).u32, 0, 0, 0 };
+    uint32_t pitches[4] = { (uint32_t)gbm_bo_get_stride(bo), 0, 0, 0 };
+    uint32_t offsets[4] = { 0, 0, 0, 0 };
+
+    int result = drmModeAddFB2(platform.fd,
+        platform.connector->modes[platform.modeIndex].hdisplay,
+        platform.connector->modes[platform.modeIndex].vdisplay,
+        DRM_FORMAT_ARGB8888,
+        handles, pitches, offsets,
         &fb, 0);
     if (result == -EINVAL) {
-       TRACELOG(LOG_WARNING, "DISPLAY: ARGB8888 rejected, retrying XRGB8888");
+        TRACELOG(LOG_WARNING, "DISPLAY: ARGB8888 rejected, retrying XRGB8888");
         result = drmModeAddFB2(platform.fd,
             platform.connector->modes[platform.modeIndex].hdisplay,
             platform.connector->modes[platform.modeIndex].vdisplay,
@@ -576,20 +579,51 @@ void SwapScreenBuffer(void)
             &fb, 0);
     }
     if (result != 0) TRACELOG(LOG_ERROR, "DISPLAY: drmModeAddFB2() failed with result: %d", result);
-    
-    result = drmModeSetCrtc(platform.fd, platform.crtc->crtc_id, fb, 0, 0, &platform.connector->connector_id, 1, &platform.connector->modes[platform.modeIndex]);
-    if (result != 0) TRACELOG(LOG_ERROR, "DISPLAY: drmModeSetCrtc() failed with result: %d", result);
 
-    if (platform.prevFB)
-    {
-        result = drmModeRmFB(platform.fd, platform.prevFB);
-        if (result != 0) TRACELOG(LOG_ERROR, "DISPLAY: drmModeRmFB() failed with result: %d", result);
+    // Perform a one-time modeset, then flip on subsequent frames.
+    static bool s_crtc_set = false;
+    if (!s_crtc_set) {
+        result = drmModeSetCrtc(platform.fd, platform.crtc->crtc_id, fb, 0, 0,
+            &platform.connector->connector_id, 1, &platform.connector->modes[platform.modeIndex]);
+        if (result != 0) TRACELOG(LOG_ERROR, "DISPLAY: drmModeSetCrtc() failed with result: %d", result);
+        s_crtc_set = true;
+        // Remove previous FB/BO if any (initial frame likely has none).
+        if (platform.prevFB) {
+            int r = drmModeRmFB(platform.fd, platform.prevFB);
+            if (r != 0) TRACELOG(LOG_ERROR, "DISPLAY: drmModeRmFB() failed with result: %d", r);
+            platform.prevFB = 0;
+        }
+        if (platform.prevBO) {
+            gbm_surface_release_buffer(platform.gbmSurface, platform.prevBO);
+            platform.prevBO = NULL;
+        }
+    } else {
+        // Queue a page flip and process the flip event non-blocking.
+        result = drmModePageFlip(platform.fd, platform.crtc->crtc_id, fb,
+                                 DRM_MODE_PAGE_FLIP_EVENT, NULL);
+        if (result != 0) TRACELOG(LOG_ERROR, "DISPLAY: drmModePageFlip() failed: %d", result);
+        // Drain any pending page flip events without stalling the loop.
+        struct pollfd pfd = { .fd = platform.fd, .events = POLLIN, .revents = 0 };
+        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+            drmEventContext ev = { 0 };
+            ev.version = 2;
+            // We don't need payload; just advance the DRM event queue.
+            ev.page_flip_handler = (void*)0;
+            drmHandleEvent(platform.fd, &ev);
+        }
+        // Now release the previously displayed FB/BO.
+        if (platform.prevFB) {
+            int r = drmModeRmFB(platform.fd, platform.prevFB);
+            if (r != 0) TRACELOG(LOG_ERROR, "DISPLAY: drmModeRmFB() failed with result: %d", r);
+            platform.prevFB = 0;
+        }
+        if (platform.prevBO) {
+            gbm_surface_release_buffer(platform.gbmSurface, platform.prevBO);
+            platform.prevBO = NULL;
+        }
     }
-
+    
     platform.prevFB = fb;
-
-    if (platform.prevBO) gbm_surface_release_buffer(platform.gbmSurface, platform.prevBO);
-
     platform.prevBO = bo;
 }
 
