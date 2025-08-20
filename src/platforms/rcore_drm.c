@@ -566,17 +566,13 @@ void SwapScreenBuffer(void)
     int result = drmModeAddFB2(platform.fd,
         platform.connector->modes[platform.modeIndex].hdisplay,
         platform.connector->modes[platform.modeIndex].vdisplay,
-        DRM_FORMAT_ARGB8888,
-        handles, pitches, offsets,
-        &fb, 0);
+        DRM_FORMAT_XRGB8888, handles, pitches, offsets, &fb, 0);
     if (result == -EINVAL) {
-        TRACELOG(LOG_WARNING, "DISPLAY: ARGB8888 rejected, retrying XRGB8888");
+        TRACELOG(LOG_WARNING, "DISPLAY: XRGB8888 rejected, retrying ARGB8888");
         result = drmModeAddFB2(platform.fd,
             platform.connector->modes[platform.modeIndex].hdisplay,
             platform.connector->modes[platform.modeIndex].vdisplay,
-            DRM_FORMAT_XRGB8888,
-            handles, pitches, offsets,
-            &fb, 0);
+            DRM_FORMAT_ARGB8888, handles, pitches, offsets, &fb, 0);
     }
     if (result != 0) TRACELOG(LOG_ERROR, "DISPLAY: drmModeAddFB2() failed with result: %d", result);
 
@@ -939,8 +935,11 @@ int InitPlatform(void)
         return -1;
     }
 
-    platform.gbmSurface = gbm_surface_create(platform.gbmDevice, platform.connector->modes[platform.modeIndex].hdisplay,
-        platform.connector->modes[platform.modeIndex].vdisplay, GBM_FORMAT_ARGB8888, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+    platform.gbmSurface = gbm_surface_create(platform.gbmDevice,
+        platform.connector->modes[platform.modeIndex].hdisplay,
+        platform.connector->modes[platform.modeIndex].vdisplay,
+        GBM_FORMAT_XRGB8888,
+        GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
     if (!platform.gbmSurface)
     {
         TRACELOG(LOG_WARNING, "DISPLAY: Failed to create GBM surface");
@@ -963,7 +962,8 @@ int InitPlatform(void)
         EGL_RED_SIZE, 8,            // RED color bit depth (alternative: 5)
         EGL_GREEN_SIZE, 8,          // GREEN color bit depth (alternative: 6)
         EGL_BLUE_SIZE, 8,           // BLUE color bit depth (alternative: 5)
-        EGL_ALPHA_SIZE, 8,        // ALPHA bit depth (required for transparent framebuffer)
+        // Do not require alpha; many KMS primary planes are XRGB
+        // EGL_ALPHA_SIZE, 8,
         //EGL_TRANSPARENT_TYPE, EGL_NONE, // Request transparent framebuffer (EGL_TRANSPARENT_RGB does not work on RPI)
         EGL_DEPTH_SIZE, 16,         // Depth buffer size (Required to use Depth testing!)
         //EGL_STENCIL_SIZE, 8,      // Stencil buffer size
@@ -1031,9 +1031,8 @@ int InitPlatform(void)
             continue;
         }
 
-        if (GBM_FORMAT_ARGB8888 == id)
-        {
-            TRACELOG(LOG_TRACE, "DISPLAY: Using EGL config: %d", i);
+        if (id == GBM_FORMAT_XRGB8888 || id == GBM_FORMAT_ARGB8888) {
+            TRACELOG(LOG_TRACE, "DISPLAY: Using EGL config: %d (native visual: 0x%x)", i, id);
             platform.config = configs[i];
             found = 1;
             break;
