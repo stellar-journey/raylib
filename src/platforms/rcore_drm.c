@@ -562,12 +562,12 @@ void SwapScreenBuffer(void)
     uint32_t handles[4] = { gbm_bo_get_handle(bo).u32, 0, 0, 0 };
     uint32_t pitches[4] = { (uint32_t)gbm_bo_get_stride(bo), 0, 0, 0 };
     uint32_t offsets[4] = { 0, 0, 0, 0 };
-    uint64_t modifier = gbm_bo_get_modifier(bo);
-    uint64_t modifiers[4] = { modifier, modifier, modifier, modifier };
     
     // Map GBM to DRM fourcc
-    uint32_t drm_fourcc = (platform.scanoutFormat == GBM_FORMAT_RGB565) ? DRM_FORMAT_RGB565 : DRM_FORMAT_XRGB8888;
-
+    uint32_t drm_fourcc = DRM_FORMAT_XRGB8888;
+    if (platform.scanoutFormat == GBM_FORMAT_ARGB8888) drm_fourcc = DRM_FORMAT_ARGB8888;
+    else if (platform.scanoutFormat == GBM_FORMAT_RGB565) drm_fourcc = DRM_FORMAT_RGB565;
+    
     TRACELOG(LOG_INFO, "DISPLAY: BO stride=%u, DRM fourcc=0x%08x, modifier=0x%llx",
         (unsigned)gbm_bo_get_stride(bo), drm_fourcc, (unsigned long long)modifier);
     
@@ -584,20 +584,30 @@ void SwapScreenBuffer(void)
             drm_fourcc, handles, pitches, offsets, &fb, 0);
     }
     
-    if (result == -EINVAL) {
-        // Try the alternate 32/16‑bpp pairing if the preferred failed
-        uint32_t alt_fourcc = (drm_fourcc == DRM_FORMAT_XRGB8888) ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_XRGB8888;
-        TRACELOG(LOG_WARNING, "DISPLAY: fourcc 0x%08x rejected, retrying 0x%08x", drm_fourcc, alt_fourcc);
-        if (modifier != DRM_FORMAT_MOD_INVALID) {
-            result = drmModeAddFB2WithModifiers(platform.fd,
-                platform.connector->modes[platform.modeIndex].hdisplay,
-                platform.connector->modes[platform.modeIndex].vdisplay,
-                alt_fourcc, handles, pitches, offsets, modifiers, &fb, DRM_MODE_FB_MODIFIERS);
-        } else {
-            result = drmModeAddFB2(platform.fd,
-                platform.connector->modes[platform.modeIndex].hdisplay,
-                platform.connector->modes[platform.modeIndex].vdisplay,
-                alt_fourcc, handles, pitches, offsets, &fb, 0);
+    if (result) {
+        TRACELOG(LOG_WARNING, "DISPLAY: drmModeAddFB2 failed %d (%s), trying alternates", result, strerror(errno));
+        uint32_t candidates[3] = { DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888, DRM_FORMAT_RGB565 };
+        for (int i = 0; i < 3 && result; i++) {
+            if (candidates[i] == drm_fourcc) continue;
+            if (modifier != DRM_FORMAT_MOD_INVALID) {
+                result = drmModeAddFB2WithModifiers(platform.fd,
+                    platform.connector->modes[platform.modeIndex].hdisplay,
+                    platform.connector->modes[platform.modeIndex].vdisplay,
+                    candidates[i], handles, pitches, offsets, modifiers, &fb, DRM_MODE_FB_MODIFIERS);
+            } else {
+                result = drmModeAddFB2(platform.fd,
+                    platform.connector->modes[platform.modeIndex].hdisplay,
+                    platform.connector->modes[platform.modeIndex].vdisplay,
+                    candidates[i], handles, pitches, offsets, &fb, 0);
+            }
+            if (!result) {
+                TRACELOG(LOG_INFO, "DISPLAY: drmModeAddFB2 succeeded with fallback fourcc=0x%08x", candidates[i]);
+                drm_fourcc = candidates[i];
+            }
+        }
+        if (result) {
+            TRACELOG(LOG_ERROR, "DISPLAY: Failed to create framebuffer for scanout");
+            // (continue with cleanup/return path as in your original code)
         }
     }
     
@@ -974,45 +984,59 @@ int InitPlatform(void)
         drmModeFreePlaneResources(plane_res);
     }
     // --- END: Debug plane format/modifier support ---
-    
+        
     // --- BEGIN: Choose scanout format based on primary plane support ---
     platform.scanoutFormat = GBM_FORMAT_XRGB8888; // default preference
-    bool planeHasXRGB = false;
-    bool planeHasRGB565 = false;
+    bool planeHasXRGB = false, planeHasARGB = false, planeHasRGB565 = false;
     
-    drmModePlaneRes *plane_res2 = drmModeGetPlaneResources(platform.fd);
-    if (plane_res2) {
-        for (uint32_t i = 0; i < plane_res2->count_planes; i++) {
-            drmModePlane *plane = drmModeGetPlane(platform.fd, plane_res2->planes[i]);
-            if (plane && (plane->crtc_id == platform.crtc->crtc_id)) {
-                for (uint32_t j = 0; j < plane->count_formats; j++) {
-                    uint32_t fmt = plane->formats[j];
-                    if (fmt == DRM_FORMAT_XRGB8888) planeHasXRGB = true;
-                    if (fmt == DRM_FORMAT_RGB565)   planeHasRGB565 = true;
+    // Compute CRTC index to test plane->possible_crtcs bitmask
+    int crtcIndex = -1;
+    drmModeRes *res_idx = drmModeGetResources(platform.fd);
+    if (res_idx) {
+        for (int i = 0; i < res_idx->count_crtcs; i++) {
+            if (res_idx->crtcs[i] == platform.crtc->crtc_id) { crtcIndex = i; break; }
+        }
+    }
+    if (res_idx) drmModeFreeResources(res_idx);
+    
+    // Scan plane formats using possible_crtcs (more robust than matching plane->crtc_id)
+    drmModePlaneRes *pres2 = drmModeGetPlaneResources(platform.fd);
+    if (pres2) {
+        for (uint32_t i = 0; i < pres2->count_planes; i++) {
+            drmModePlane *pl = drmModeGetPlane(platform.fd, pres2->planes[i]);
+            if (!pl) continue;
+            bool forThisCrtc = (crtcIndex >= 0) ? ((pl->possible_crtcs & (1 << crtcIndex)) != 0) : (pl->crtc_id == platform.crtc->crtc_id);
+            if (forThisCrtc) {
+                for (uint32_t j = 0; j < pl->count_formats; j++) {
+                    uint32_t f = pl->formats[j];
+                    if (f == DRM_FORMAT_XRGB8888) planeHasXRGB = true;
+                    if (f == DRM_FORMAT_ARGB8888) planeHasARGB = true;
+                    if (f == DRM_FORMAT_RGB565)   planeHasRGB565 = true;
                 }
             }
-            if (plane) drmModeFreePlane(plane);
+            drmModeFreePlane(pl);
         }
-        drmModeFreePlaneResources(plane_res2);
+        drmModeFreePlaneResources(pres2);
     }
     
-    // Prefer XRGB8888 if advertised; otherwise fall back to RGB565 if available.
-    // As a safety for 4K, if plane claims XRGB but 3840x2160@>=30, RGB565 is often the only
-    // bandwidth-safe choice on this BSP; prefer RGB565 in that case.
+    // Prefer XRGB8888 generally, but at 3840x2160@>=30 prefer RGB565 if available; else ARGB8888.
     const drmModeModeInfo *mm = &platform.connector->modes[platform.modeIndex];
-    bool is4k30 = (mm->hdisplay >= 3840 && mm->vdisplay >= 2160 && mm->vrefresh >= 30);
+    bool is4k = (mm->hdisplay >= 3840 && mm->vdisplay >= 2160 && mm->vrefresh >= 30);
     
-    if (is4k30) {
-        if (planeHasRGB565) platform.scanoutFormat = GBM_FORMAT_RGB565;
-        else if (planeHasXRGB) platform.scanoutFormat = GBM_FORMAT_XRGB8888;
+    if (is4k) {
+        if (planeHasRGB565)      platform.scanoutFormat = GBM_FORMAT_RGB565;
+        else if (planeHasARGB)   platform.scanoutFormat = GBM_FORMAT_ARGB8888;
+        else if (planeHasXRGB)   platform.scanoutFormat = GBM_FORMAT_XRGB8888;
     } else {
-        if (planeHasXRGB) platform.scanoutFormat = GBM_FORMAT_XRGB8888;
+        if (planeHasXRGB)        platform.scanoutFormat = GBM_FORMAT_XRGB8888;
+        else if (planeHasARGB)   platform.scanoutFormat = GBM_FORMAT_ARGB8888;
         else if (planeHasRGB565) platform.scanoutFormat = GBM_FORMAT_RGB565;
     }
     
     TRACELOG(LOG_INFO, "DISPLAY: Chosen GBM scanout format: %4.4s (0x%08x)",
             (char*)&platform.scanoutFormat, platform.scanoutFormat);
     // --- END: Choose scanout format ---
+
 
     platform.gbmDevice = gbm_create_device(platform.fd);
     if (!platform.gbmDevice)
