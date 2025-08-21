@@ -558,23 +558,44 @@ void SwapScreenBuffer(void)
     if (!bo) TRACELOG(LOG_ERROR, "DISPLAY: Failed GBM to lock front buffer");
 
     uint32_t fb = 0;
-    // If your tree still has drmModeAddFB here, ensure 0001 applies before this patch.
     uint32_t handles[4] = { gbm_bo_get_handle(bo).u32, 0, 0, 0 };
     uint32_t pitches[4] = { (uint32_t)gbm_bo_get_stride(bo), 0, 0, 0 };
     uint32_t offsets[4] = { 0, 0, 0, 0 };
-
-    int result = drmModeAddFB2(platform.fd,
-        platform.connector->modes[platform.modeIndex].hdisplay,
-        platform.connector->modes[platform.modeIndex].vdisplay,
-        DRM_FORMAT_XRGB8888, handles, pitches, offsets, &fb, 0);
-    if (result == -EINVAL) {
-        TRACELOG(LOG_WARNING, "DISPLAY: XRGB8888 rejected, retrying ARGB8888");
+    uint64_t modifier = gbm_bo_get_modifier(bo);
+    uint64_t modifiers[4] = { modifier, modifier, modifier, modifier };
+    
+    int result;
+    if (modifier != DRM_FORMAT_MOD_INVALID) {
+        result = drmModeAddFB2WithModifiers(platform.fd,
+            platform.connector->modes[platform.modeIndex].hdisplay,
+            platform.connector->modes[platform.modeIndex].vdisplay,
+            DRM_FORMAT_XRGB8888, handles, pitches, offsets, modifiers, &fb,
+            DRM_MODE_FB_MODIFIERS);
+    } else {
         result = drmModeAddFB2(platform.fd,
             platform.connector->modes[platform.modeIndex].hdisplay,
             platform.connector->modes[platform.modeIndex].vdisplay,
-            DRM_FORMAT_ARGB8888, handles, pitches, offsets, &fb, 0);
+            DRM_FORMAT_XRGB8888, handles, pitches, offsets, &fb, 0);
     }
-    if (result != 0) TRACELOG(LOG_ERROR, "DISPLAY: drmModeAddFB2() failed with result: %d", result);
+    
+    if (result == -EINVAL) {
+        TRACELOG(LOG_WARNING, "DISPLAY: XRGB8888 rejected, retrying ARGB8888");
+        if (modifier != DRM_FORMAT_MOD_INVALID) {
+            result = drmModeAddFB2WithModifiers(platform.fd,
+                platform.connector->modes[platform.modeIndex].hdisplay,
+                platform.connector->modes[platform.modeIndex].vdisplay,
+                DRM_FORMAT_ARGB8888, handles, pitches, offsets, modifiers, &fb,
+                DRM_MODE_FB_MODIFIERS);
+        } else {
+            result = drmModeAddFB2(platform.fd,
+                platform.connector->modes[platform.modeIndex].hdisplay,
+                platform.connector->modes[platform.modeIndex].vdisplay,
+                DRM_FORMAT_ARGB8888, handles, pitches, offsets, &fb, 0);
+        }
+    }
+    
+    if (result != 0)
+        TRACELOG(LOG_ERROR, "DISPLAY: drmModeAddFB2[WithModifiers]() failed: %d", result);
 
     // Perform a one-time modeset, then flip on subsequent frames.
     static bool s_crtc_set = false;
@@ -927,6 +948,25 @@ int InitPlatform(void)
 
     drmModeFreeResources(res);
     res = NULL;
+
+    // --- BEGIN: Debug plane format/modifier support ---
+    drmModePlaneRes *plane_res = drmModeGetPlaneResources(platform.fd);
+    if (plane_res) {
+        for (uint32_t i = 0; i < plane_res->count_planes; i++) {
+            drmModePlane *plane = drmModeGetPlane(platform.fd, plane_res->planes[i]);
+            if (plane && (plane->crtc_id == platform.crtc->crtc_id)) {
+                TRACELOG(LOG_INFO, "DISPLAY: Primary plane %u supports %u formats:",
+                         plane->plane_id, plane->count_formats);
+                for (uint32_t j = 0; j < plane->count_formats; j++) {
+                    uint32_t fmt = plane->formats[j];
+                    TRACELOG(LOG_INFO, "  format: %4.4s (0x%08x)", (char*)&fmt, fmt);
+                }
+            }
+            if (plane) drmModeFreePlane(plane);
+        }
+        drmModeFreePlaneResources(plane_res);
+    }
+    // --- END: Debug plane format/modifier support ---
 
     platform.gbmDevice = gbm_create_device(platform.fd);
     if (!platform.gbmDevice)
