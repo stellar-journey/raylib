@@ -557,11 +557,15 @@ void SwapScreenBuffer(void)
 
     struct gbm_bo *bo = gbm_surface_lock_front_buffer(platform.gbmSurface);
     if (!bo) TRACELOG(LOG_ERROR, "DISPLAY: Failed GBM to lock front buffer");
-
+    
     uint32_t fb = 0;
     uint32_t handles[4] = { gbm_bo_get_handle(bo).u32, 0, 0, 0 };
     uint32_t pitches[4] = { (uint32_t)gbm_bo_get_stride(bo), 0, 0, 0 };
     uint32_t offsets[4] = { 0, 0, 0, 0 };
+    
+    // Get the GBM BO's modifier and set up the modifiers array
+    uint64_t modifier = gbm_bo_get_modifier(bo);
+    uint64_t modifiers[4] = { modifier, modifier, modifier, modifier };
     
     // Map GBM to DRM fourcc
     uint32_t drm_fourcc = DRM_FORMAT_XRGB8888;
@@ -585,7 +589,8 @@ void SwapScreenBuffer(void)
     }
     
     if (result) {
-        TRACELOG(LOG_WARNING, "DISPLAY: drmModeAddFB2 failed %d (%s), trying alternates", result, strerror(errno));
+        TRACELOG(LOG_WARNING, "DISPLAY: drmModeAddFB2 failed %d (%s), trying alternates",
+            result, strerror(errno));
         uint32_t candidates[3] = { DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888, DRM_FORMAT_RGB565 };
         for (int i = 0; i < 3 && result; i++) {
             if (candidates[i] == drm_fourcc) continue;
@@ -601,19 +606,21 @@ void SwapScreenBuffer(void)
                     candidates[i], handles, pitches, offsets, &fb, 0);
             }
             if (!result) {
-                TRACELOG(LOG_INFO, "DISPLAY: drmModeAddFB2 succeeded with fallback fourcc=0x%08x", candidates[i]);
+                TRACELOG(LOG_INFO, "DISPLAY: drmModeAddFB2 succeeded with fallback fourcc=0x%08x",
+                    candidates[i]);
                 drm_fourcc = candidates[i];
             }
         }
         if (result) {
             TRACELOG(LOG_ERROR, "DISPLAY: Failed to create framebuffer for scanout");
-            // (continue with cleanup/return path as in your original code)
+            // (continue with your cleanup/return path)
         }
     }
     
     if (result != 0)
         TRACELOG(LOG_ERROR, "DISPLAY: drmModeAddFB2[WithModifiers]() failed: %d", result);
 
+    
     // Perform a one-time modeset, then flip on subsequent frames.
     static bool s_crtc_set = false;
     if (!s_crtc_set) {
