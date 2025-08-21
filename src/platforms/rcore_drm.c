@@ -108,6 +108,7 @@ typedef struct {
     EGLSurface surface;                 // Surface to draw on, framebuffers (connected to context)
     EGLContext context;                 // Graphic context, mode in which drawing can be done
     EGLConfig config;                   // Graphic config
+    uint32_t scanoutFormat;             // GBM/DRM fourcc chosen for scanout (e.g., GBM_FORMAT_XRGB8888 or GBM_FORMAT_RGB565)
 
     // Keyboard data
     int defaultKeyboardMode;            // Default keyboard mode
@@ -564,33 +565,39 @@ void SwapScreenBuffer(void)
     uint64_t modifier = gbm_bo_get_modifier(bo);
     uint64_t modifiers[4] = { modifier, modifier, modifier, modifier };
     
+    // Map GBM to DRM fourcc
+    uint32_t drm_fourcc = (platform.scanoutFormat == GBM_FORMAT_RGB565) ? DRM_FORMAT_RGB565 : DRM_FORMAT_XRGB8888;
+
+    TRACELOG(LOG_INFO, "DISPLAY: BO stride=%u, DRM fourcc=0x%08x, modifier=0x%llx",
+        (unsigned)gbm_bo_get_stride(bo), drm_fourcc, (unsigned long long)modifier);
+    
     int result;
     if (modifier != DRM_FORMAT_MOD_INVALID) {
         result = drmModeAddFB2WithModifiers(platform.fd,
             platform.connector->modes[platform.modeIndex].hdisplay,
             platform.connector->modes[platform.modeIndex].vdisplay,
-            DRM_FORMAT_XRGB8888, handles, pitches, offsets, modifiers, &fb,
-            DRM_MODE_FB_MODIFIERS);
+            drm_fourcc, handles, pitches, offsets, modifiers, &fb, DRM_MODE_FB_MODIFIERS);
     } else {
         result = drmModeAddFB2(platform.fd,
             platform.connector->modes[platform.modeIndex].hdisplay,
             platform.connector->modes[platform.modeIndex].vdisplay,
-            DRM_FORMAT_XRGB8888, handles, pitches, offsets, &fb, 0);
+            drm_fourcc, handles, pitches, offsets, &fb, 0);
     }
     
     if (result == -EINVAL) {
-        TRACELOG(LOG_WARNING, "DISPLAY: XRGB8888 rejected, retrying ARGB8888");
+        // Try the alternate 32/16‑bpp pairing if the preferred failed
+        uint32_t alt_fourcc = (drm_fourcc == DRM_FORMAT_XRGB8888) ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_XRGB8888;
+        TRACELOG(LOG_WARNING, "DISPLAY: fourcc 0x%08x rejected, retrying 0x%08x", drm_fourcc, alt_fourcc);
         if (modifier != DRM_FORMAT_MOD_INVALID) {
             result = drmModeAddFB2WithModifiers(platform.fd,
                 platform.connector->modes[platform.modeIndex].hdisplay,
                 platform.connector->modes[platform.modeIndex].vdisplay,
-                DRM_FORMAT_ARGB8888, handles, pitches, offsets, modifiers, &fb,
-                DRM_MODE_FB_MODIFIERS);
+                alt_fourcc, handles, pitches, offsets, modifiers, &fb, DRM_MODE_FB_MODIFIERS);
         } else {
             result = drmModeAddFB2(platform.fd,
                 platform.connector->modes[platform.modeIndex].hdisplay,
                 platform.connector->modes[platform.modeIndex].vdisplay,
-                DRM_FORMAT_ARGB8888, handles, pitches, offsets, &fb, 0);
+                alt_fourcc, handles, pitches, offsets, &fb, 0);
         }
     }
     
@@ -967,6 +974,45 @@ int InitPlatform(void)
         drmModeFreePlaneResources(plane_res);
     }
     // --- END: Debug plane format/modifier support ---
+    
+    // --- BEGIN: Choose scanout format based on primary plane support ---
+    platform.scanoutFormat = GBM_FORMAT_XRGB8888; // default preference
+    bool planeHasXRGB = false;
+    bool planeHasRGB565 = false;
+    
+    drmModePlaneRes *plane_res2 = drmModeGetPlaneResources(platform.fd);
+    if (plane_res2) {
+        for (uint32_t i = 0; i < plane_res2->count_planes; i++) {
+            drmModePlane *plane = drmModeGetPlane(platform.fd, plane_res2->planes[i]);
+            if (plane && (plane->crtc_id == platform.crtc->crtc_id)) {
+                for (uint32_t j = 0; j < plane->count_formats; j++) {
+                    uint32_t fmt = plane->formats[j];
+                    if (fmt == DRM_FORMAT_XRGB8888) planeHasXRGB = true;
+                    if (fmt == DRM_FORMAT_RGB565)   planeHasRGB565 = true;
+                }
+            }
+            if (plane) drmModeFreePlane(plane);
+        }
+        drmModeFreePlaneResources(plane_res2);
+    }
+    
+    // Prefer XRGB8888 if advertised; otherwise fall back to RGB565 if available.
+    // As a safety for 4K, if plane claims XRGB but 3840x2160@>=30, RGB565 is often the only
+    // bandwidth-safe choice on this BSP; prefer RGB565 in that case.
+    const drmModeModeInfo *mm = &platform.connector->modes[platform.modeIndex];
+    bool is4k30 = (mm->hdisplay >= 3840 && mm->vdisplay >= 2160 && mm->vrefresh >= 30);
+    
+    if (is4k30) {
+        if (planeHasRGB565) platform.scanoutFormat = GBM_FORMAT_RGB565;
+        else if (planeHasXRGB) platform.scanoutFormat = GBM_FORMAT_XRGB8888;
+    } else {
+        if (planeHasXRGB) platform.scanoutFormat = GBM_FORMAT_XRGB8888;
+        else if (planeHasRGB565) platform.scanoutFormat = GBM_FORMAT_RGB565;
+    }
+    
+    TRACELOG(LOG_INFO, "DISPLAY: Chosen GBM scanout format: %4.4s (0x%08x)",
+            (char*)&platform.scanoutFormat, platform.scanoutFormat);
+    // --- END: Choose scanout format ---
 
     platform.gbmDevice = gbm_create_device(platform.fd);
     if (!platform.gbmDevice)
@@ -978,7 +1024,7 @@ int InitPlatform(void)
     platform.gbmSurface = gbm_surface_create(platform.gbmDevice,
         platform.connector->modes[platform.modeIndex].hdisplay,
         platform.connector->modes[platform.modeIndex].vdisplay,
-        GBM_FORMAT_XRGB8888,
+        platform.scanoutFormat,
         GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
     if (!platform.gbmSurface)
     {
@@ -1059,24 +1105,31 @@ int InitPlatform(void)
     }
 
     TRACELOG(LOG_TRACE, "DISPLAY: EGL matching configs available: %d", matchingNumConfigs);
-
-    // find the EGL config that matches the previously setup GBM format
+    
+    // find an EGL config that matches platform.scanoutFormat; accept close alternatives
     int found = 0;
-    for (EGLint i = 0; i < matchingNumConfigs; ++i)
-    {
+    EGLint bestIdx = -1, bestId = 0;
+    for (EGLint i = 0; i < matchingNumConfigs; ++i) {
         EGLint id = 0;
-        if (!eglGetConfigAttrib(platform.device, configs[i], EGL_NATIVE_VISUAL_ID, &id))
-        {
+        if (!eglGetConfigAttrib(platform.device, configs[i], EGL_NATIVE_VISUAL_ID, &id)) {
             TRACELOG(LOG_WARNING, "DISPLAY: Failed to get EGL config attribute: 0x%x", eglGetError());
             continue;
         }
-
-        if (id == GBM_FORMAT_XRGB8888 || id == GBM_FORMAT_ARGB8888) {
-            TRACELOG(LOG_TRACE, "DISPLAY: Using EGL config: %d (native visual: 0x%x)", i, id);
-            platform.config = configs[i];
-            found = 1;
-            break;
+        // Perfect match to chosen GBM visual
+        if (id == (EGLint)platform.scanoutFormat) {
+            bestIdx = i; bestId = id; found = 1; break;
         }
+        // Otherwise remember acceptable alternates
+        if (id == GBM_FORMAT_XRGB8888 || id == GBM_FORMAT_ARGB8888 || id == GBM_FORMAT_RGB565) {
+            if (bestIdx < 0) { bestIdx = i; bestId = id; }
+        }
+    }
+    if (!found && bestIdx >= 0) { platform.config = configs[bestIdx]; found = 1;
+        TRACELOG(LOG_INFO, "DISPLAY: Using EGL config alt: %d (native visual: 0x%x)", bestIdx, bestId);
+    }
+
+    if (!found && bestIdx >= 0) { platform.config = configs[bestIdx]; found = 1;
+        TRACELOG(LOG_INFO, "DISPLAY: Using EGL config alt: %d (native visual: 0x%x)", bestIdx, bestId);
     }
 
     RL_FREE(configs);
