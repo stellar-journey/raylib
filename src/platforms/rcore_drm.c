@@ -1082,7 +1082,7 @@ int InitPlatform(void)
         sampleBuffer = 1;
         TRACELOG(LOG_INFO, "DISPLAY: Trying to enable MSAA x4");
     }
-    
+
     // Build framebuffer attributes to match the GBM visual; do not overconstrain color sizes at 4K.
     EGLint rsz = 8, gsz = 8, bsz = 8, asz = 0;
     if (platform.scanoutFormat == GBM_FORMAT_RGB565) { rsz = 5; gsz = 6; bsz = 5; asz = 0; }
@@ -1100,14 +1100,25 @@ int InitPlatform(void)
         EGL_NONE
     };
     
-    // First pass: strict sizes; second pass: relaxed sizes (let native visual drive)
-    EGLConfig *configs = RL_CALLOC(numConfigs, sizeof(*configs));
-    if (!configs) { TRACELOG(LOG_WARNING, "DISPLAY: Failed to get memory for EGL configs"); return -1; }
+    // Query how many configs EGL can return
+    EGLint numConfigs = 0;
+    if (!eglGetConfigs(platform.device, NULL, 0, &numConfigs) || numConfigs <= 0) {
+        TRACELOG(LOG_WARNING, "DISPLAY: eglGetConfigs() returned no configs: 0x%x", eglGetError());
+        return -1;
+    }
     
+    // Allocate config array
+    EGLConfig *configs = RL_CALLOC(numConfigs, sizeof(*configs));
+    if (!configs) {
+        TRACELOG(LOG_WARNING, "DISPLAY: Failed to get memory for EGL configs");
+        return -1;
+    }
+    
+    // First pass: strict sizes; second pass: relaxed (let native visual drive)
     EGLint matchingNumConfigs = 0;
     if (!eglChooseConfig(platform.device, framebufferAttribs_strict, configs, numConfigs, &matchingNumConfigs)) {
         TRACELOG(LOG_INFO, "DISPLAY: Strict EGL config match failed (0x%x), retrying relaxed", eglGetError());
-        // Relaxed: only require window surface + GLES2/3; leave color sizes unspecified
+    
         EGLint framebufferAttribs_relaxed[] = {
             EGL_RENDERABLE_TYPE, (rlGetVersion() == RL_OPENGL_ES_30)? EGL_OPENGL_ES3_BIT : EGL_OPENGL_ES2_BIT,
             EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
@@ -1124,7 +1135,7 @@ int InitPlatform(void)
     }
     TRACELOG(LOG_TRACE, "DISPLAY: EGL matching configs available: %d", matchingNumConfigs);
     
-    // Find an EGL config that matches platform.scanoutFormat; accept close alternates
+    // Pick an EGL config that matches platform.scanoutFormat; accept close alternates
     int found = 0; EGLint bestIdx = -1, bestId = 0;
     for (EGLint i = 0; i < matchingNumConfigs; ++i) {
         EGLint id = 0;
@@ -1132,51 +1143,31 @@ int InitPlatform(void)
             TRACELOG(LOG_WARNING, "DISPLAY: eglGetConfigAttrib(EGL_NATIVE_VISUAL_ID) failed: 0x%x", eglGetError());
             continue;
         }
-        if (id == (EGLint)platform.scanoutFormat) { platform.config = configs[i]; bestIdx = i; bestId = id; found = 1; break; }
+        if (id == (EGLint)platform.scanoutFormat) {
+            platform.config = configs[i];
+            bestIdx = i; bestId = id; found = 1; break;
+        }
         if ((id == GBM_FORMAT_ARGB8888) || (id == GBM_FORMAT_XRGB8888) || (id == GBM_FORMAT_RGB565)) {
             if (bestIdx < 0) { bestIdx = i; bestId = id; }
         }
     }
-    if (!found && bestIdx >= 0) { platform.config = configs[bestIdx]; found = 1; TRACELOG(LOG_INFO, "DISPLAY: Using EGL config alt: %d (native visual: 0x%x)", bestIdx, bestId); }
-    RL_FREE(configs);
-    if (!found) { TRACELOG(LOG_WARNING, "DISPLAY: Failed to find a suitable EGL config"); return -1; }
-
-    TRACELOG(LOG_TRACE, "DISPLAY: EGL matching configs available: %d", matchingNumConfigs);
-    
-    // find an EGL config that matches platform.scanoutFormat; accept close alternatives
-    int found = 0;
-    EGLint bestIdx = -1, bestId = 0;
-    for (EGLint i = 0; i < matchingNumConfigs; ++i) {
-        EGLint id = 0;
-        if (!eglGetConfigAttrib(platform.device, configs[i], EGL_NATIVE_VISUAL_ID, &id)) {
-            TRACELOG(LOG_WARNING, "DISPLAY: Failed to get EGL config attribute: 0x%x", eglGetError());
-            continue;
-        }
-        // Perfect match to chosen GBM visual
-        if (id == (EGLint)platform.scanoutFormat) {
-            bestIdx = i; bestId = id; found = 1; break;
-        }
-        // Otherwise remember acceptable alternates
-        if (id == GBM_FORMAT_XRGB8888 || id == GBM_FORMAT_ARGB8888 || id == GBM_FORMAT_RGB565) {
-            if (bestIdx < 0) { bestIdx = i; bestId = id; }
-        }
-    }
-    if (!found && bestIdx >= 0) { platform.config = configs[bestIdx]; found = 1;
+    if (!found && bestIdx >= 0) {
+        platform.config = configs[bestIdx];
+        found = 1;
         TRACELOG(LOG_INFO, "DISPLAY: Using EGL config alt: %d (native visual: 0x%x)", bestIdx, bestId);
     }
-
-    if (!found && bestIdx >= 0) { platform.config = configs[bestIdx]; found = 1;
-        TRACELOG(LOG_INFO, "DISPLAY: Using EGL config alt: %d (native visual: 0x%x)", bestIdx, bestId);
-    }
-
     RL_FREE(configs);
-
-    if (!found)
-    {
+    if (!found) {
         TRACELOG(LOG_WARNING, "DISPLAY: Failed to find a suitable EGL config");
         return -1;
     }
 
+    // Define context attributes (GLES 2 or 3 depending on rlGetVersion)
+    const EGLint contextAttribs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, (rlGetVersion() == RL_OPENGL_ES_30)? 3 : 2,
+        EGL_NONE
+    };
+    
     // Set rendering API
     eglBindAPI(EGL_OPENGL_ES_API);
 
