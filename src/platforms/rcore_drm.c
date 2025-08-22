@@ -1048,7 +1048,16 @@ int InitPlatform(void)
 
     // If both AR24 and RG16 are available at 4K, RG16 usually matches fbcon and reduces bandwidth.
     if (is4k && planeHasARGB && planeHasRGB565) platform.scanoutFormat = GBM_FORMAT_RGB565;
-    
+
+    // --- BEGIN: Harden 4K guard to avoid XR24 at 4K ---
+    if (is4k && (platform.scanoutFormat == GBM_FORMAT_XRGB8888)) {
+        if (planeHasRGB565)      platform.scanoutFormat = GBM_FORMAT_RGB565;
+        else if (planeHasARGB)   platform.scanoutFormat = GBM_FORMAT_ARGB8888;
+    }
+    // If both AR24 and RG16 are available at 4K, prefer RG16 (matches fbcon)
+    if (is4k && planeHasARGB && planeHasRGB565) platform.scanoutFormat = GBM_FORMAT_RGB565;
+    // --- END: Harden 4K guard ---
+
     TRACELOG(LOG_INFO, "DISPLAY: Chosen GBM scanout format: %4.4s (0x%08x)",
             (char*)&platform.scanoutFormat, platform.scanoutFormat);
     // --- END: Choose scanout format ---
@@ -1073,6 +1082,33 @@ int InitPlatform(void)
         TRACELOG(LOG_WARNING, "DISPLAY: Failed to create GBM surface");
         return -1;
     }
+    
+    // --- BEGIN: Obtain and initialize EGLDisplay from GBM ---
+    #ifndef EGL_PLATFORM_GBM_KHR
+    #define EGL_PLATFORM_GBM_KHR 0x31D7
+    #endif
+    typedef EGLDisplay (EGLAPIENTRYP PFNEGLGETPLATFORMDISPLAYEXTPROC)(EGLenum, void*, const EGLint*);
+    PFNEGLGETPLATFORMDISPLAYEXTPROC getPlatformDisplayEXT =
+        (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+    
+    if (getPlatformDisplayEXT) {
+        platform.device = getPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR, platform.gbmDevice, NULL);
+    } else {
+        platform.device = eglGetDisplay((EGLNativeDisplayType)platform.gbmDevice);
+    }
+    
+    if (platform.device == EGL_NO_DISPLAY) {
+        TRACELOG(LOG_WARNING, "DISPLAY: eglGetDisplay/eglGetPlatformDisplayEXT failed: 0x%04x", eglGetError());
+        return -1;
+    }
+    
+    EGLint eglMajor = 0, eglMinor = 0;
+    if (!eglInitialize(platform.device, &eglMajor, &eglMinor)) {
+        TRACELOG(LOG_WARNING, "DISPLAY: eglInitialize() failed: 0x%04x", eglGetError());
+        return -1;
+    }
+    TRACELOG(LOG_INFO, "DISPLAY: EGL initialized %d.%d", eglMajor, eglMinor);
+    // --- END: Obtain and initialize EGLDisplay from GBM ---
 
     EGLint samples = 0;
     EGLint sampleBuffer = 0;
