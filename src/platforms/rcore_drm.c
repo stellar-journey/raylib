@@ -243,6 +243,18 @@ static int FindPreferredConnectorMode(const drmModeConnector *connector);       
 static int FindExactSizeConnectorMode(const drmModeConnector *connector, uint width, uint height, bool allowInterlaced);            // Exact WxH ignoring fps
 
 //----------------------------------------------------------------------------------
+// Page-flip event handler: consumes events so the next flip won't return -EBUSY
+//----------------------------------------------------------------------------------
+static void page_flip_handler(int fd, unsigned int sequence,
+                              unsigned int tv_sec, unsigned int tv_usec,
+                              void *user_data)
+{
+    (void)fd; (void)sequence; (void)tv_sec; (void)tv_usec; (void)user_data;
+    // No-op: we just need to process the event to clear the pending flip
+    TRACELOG(LOG_INFO, "DISPLAY: page_flip event handled");
+}
+
+//----------------------------------------------------------------------------------
 // Module Functions Declaration
 //----------------------------------------------------------------------------------
 // NOTE: Functions declaration is provided by raylib.h
@@ -643,15 +655,18 @@ void SwapScreenBuffer(void)
         result = drmModePageFlip(platform.fd, platform.crtc->crtc_id, fb,
                                  DRM_MODE_PAGE_FLIP_EVENT, NULL);
         if (result != 0) TRACELOG(LOG_ERROR, "DISPLAY: drmModePageFlip() failed: %d", result);
+        
         // Drain any pending page flip events without stalling the loop.
         struct pollfd pfd = { .fd = platform.fd, .events = POLLIN, .revents = 0 };
-        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
-            drmEventContext ev = { 0 };
-            ev.version = 2;
-            // We don't need payload; just advance the DRM event queue.
-            ev.page_flip_handler = (void*)0;
+        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN))
+        {
+            drmEventContext ev = {
+                .version           = 2,               // DRM event API version
+                .page_flip_handler = page_flip_handler
+            };
             drmHandleEvent(platform.fd, &ev);
         }
+        
         // Now release the previously displayed FB/BO.
         if (platform.prevFB) {
             int r = drmModeRmFB(platform.fd, platform.prevFB);
