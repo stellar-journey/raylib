@@ -1082,69 +1082,64 @@ int InitPlatform(void)
         sampleBuffer = 1;
         TRACELOG(LOG_INFO, "DISPLAY: Trying to enable MSAA x4");
     }
-
-    const EGLint framebufferAttribs[] =
-    {
-        EGL_RENDERABLE_TYPE, (rlGetVersion() == RL_OPENGL_ES_30)? EGL_OPENGL_ES3_BIT : EGL_OPENGL_ES2_BIT,      // Type of context support
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,          // Don't use it on Android!
-        EGL_RED_SIZE, 8,            // RED color bit depth (alternative: 5)
-        EGL_GREEN_SIZE, 8,          // GREEN color bit depth (alternative: 6)
-        EGL_BLUE_SIZE, 8,           // BLUE color bit depth (alternative: 5)
-        // Do not require alpha; many KMS primary planes are XRGB
-        // EGL_ALPHA_SIZE, 8,
-        //EGL_TRANSPARENT_TYPE, EGL_NONE, // Request transparent framebuffer (EGL_TRANSPARENT_RGB does not work on RPI)
-        EGL_DEPTH_SIZE, 16,         // Depth buffer size (Required to use Depth testing!)
-        //EGL_STENCIL_SIZE, 8,      // Stencil buffer size
-        EGL_SAMPLE_BUFFERS, sampleBuffer,    // Activate MSAA
-        EGL_SAMPLES, samples,       // 4x Antialiasing if activated (Free on MALI GPUs)
+    
+    // Build framebuffer attributes to match the GBM visual; do not overconstrain color sizes at 4K.
+    EGLint rsz = 8, gsz = 8, bsz = 8, asz = 0;
+    if (platform.scanoutFormat == GBM_FORMAT_RGB565) { rsz = 5; gsz = 6; bsz = 5; asz = 0; }
+    else if (platform.scanoutFormat == GBM_FORMAT_ARGB8888) { rsz = 8; gsz = 8; bsz = 8; asz = 8; }
+    
+    EGLint framebufferAttribs_strict[] = {
+        EGL_RENDERABLE_TYPE, (rlGetVersion() == RL_OPENGL_ES_30)? EGL_OPENGL_ES3_BIT : EGL_OPENGL_ES2_BIT,
+        EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
+        EGL_RED_SIZE,        rsz,
+        EGL_GREEN_SIZE,      gsz,
+        EGL_BLUE_SIZE,       bsz,
+        EGL_DEPTH_SIZE,      16,
+        EGL_SAMPLE_BUFFERS,  sampleBuffer,
+        EGL_SAMPLES,         samples,
         EGL_NONE
     };
-
-    const EGLint contextAttribs[] = {
-        EGL_CONTEXT_CLIENT_VERSION, 2,
-        EGL_NONE
-    };
-
-    EGLint numConfigs = 0;
-
-    // Get an EGL device connection
-    platform.device = eglGetDisplay((EGLNativeDisplayType)platform.gbmDevice);
-    if (platform.device == EGL_NO_DISPLAY)
-    {
-        TRACELOG(LOG_WARNING, "DISPLAY: Failed to initialize EGL device");
-        return -1;
-    }
-
-    // Initialize the EGL device connection
-    if (eglInitialize(platform.device, NULL, NULL) == EGL_FALSE)
-    {
-        // If all of the calls to eglInitialize returned EGL_FALSE then an error has occurred.
-        TRACELOG(LOG_WARNING, "DISPLAY: Failed to initialize EGL device");
-        return -1;
-    }
-
-    if (!eglChooseConfig(platform.device, NULL, NULL, 0, &numConfigs))
-    {
-        TRACELOG(LOG_WARNING, "DISPLAY: Failed to get EGL config count: 0x%x", eglGetError());
-        return -1;
-    }
-
-    TRACELOG(LOG_TRACE, "DISPLAY: EGL configs available: %d", numConfigs);
-
+    
+    // First pass: strict sizes; second pass: relaxed sizes (let native visual drive)
     EGLConfig *configs = RL_CALLOC(numConfigs, sizeof(*configs));
-    if (!configs)
-    {
-        TRACELOG(LOG_WARNING, "DISPLAY: Failed to get memory for EGL configs");
-        return -1;
-    }
-
+    if (!configs) { TRACELOG(LOG_WARNING, "DISPLAY: Failed to get memory for EGL configs"); return -1; }
+    
     EGLint matchingNumConfigs = 0;
-    if (!eglChooseConfig(platform.device, framebufferAttribs, configs, numConfigs, &matchingNumConfigs))
-    {
-        TRACELOG(LOG_WARNING, "DISPLAY: Failed to choose EGL config: 0x%x", eglGetError());
-        free(configs);
-        return -1;
+    if (!eglChooseConfig(platform.device, framebufferAttribs_strict, configs, numConfigs, &matchingNumConfigs)) {
+        TRACELOG(LOG_INFO, "DISPLAY: Strict EGL config match failed (0x%x), retrying relaxed", eglGetError());
+        // Relaxed: only require window surface + GLES2/3; leave color sizes unspecified
+        EGLint framebufferAttribs_relaxed[] = {
+            EGL_RENDERABLE_TYPE, (rlGetVersion() == RL_OPENGL_ES_30)? EGL_OPENGL_ES3_BIT : EGL_OPENGL_ES2_BIT,
+            EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
+            EGL_DEPTH_SIZE,      16,
+            EGL_SAMPLE_BUFFERS,  sampleBuffer,
+            EGL_SAMPLES,         samples,
+            EGL_NONE
+        };
+        if (!eglChooseConfig(platform.device, framebufferAttribs_relaxed, configs, numConfigs, &matchingNumConfigs)) {
+            TRACELOG(LOG_WARNING, "DISPLAY: Failed to choose any EGL config: 0x%x", eglGetError());
+            RL_FREE(configs);
+            return -1;
+        }
     }
+    TRACELOG(LOG_TRACE, "DISPLAY: EGL matching configs available: %d", matchingNumConfigs);
+    
+    // Find an EGL config that matches platform.scanoutFormat; accept close alternates
+    int found = 0; EGLint bestIdx = -1, bestId = 0;
+    for (EGLint i = 0; i < matchingNumConfigs; ++i) {
+        EGLint id = 0;
+        if (!eglGetConfigAttrib(platform.device, configs[i], EGL_NATIVE_VISUAL_ID, &id)) {
+            TRACELOG(LOG_WARNING, "DISPLAY: eglGetConfigAttrib(EGL_NATIVE_VISUAL_ID) failed: 0x%x", eglGetError());
+            continue;
+        }
+        if (id == (EGLint)platform.scanoutFormat) { platform.config = configs[i]; bestIdx = i; bestId = id; found = 1; break; }
+        if ((id == GBM_FORMAT_ARGB8888) || (id == GBM_FORMAT_XRGB8888) || (id == GBM_FORMAT_RGB565)) {
+            if (bestIdx < 0) { bestIdx = i; bestId = id; }
+        }
+    }
+    if (!found && bestIdx >= 0) { platform.config = configs[bestIdx]; found = 1; TRACELOG(LOG_INFO, "DISPLAY: Using EGL config alt: %d (native visual: 0x%x)", bestIdx, bestId); }
+    RL_FREE(configs);
+    if (!found) { TRACELOG(LOG_WARNING, "DISPLAY: Failed to find a suitable EGL config"); return -1; }
 
     TRACELOG(LOG_TRACE, "DISPLAY: EGL matching configs available: %d", matchingNumConfigs);
     
