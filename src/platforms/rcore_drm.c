@@ -1063,6 +1063,18 @@ int InitPlatform(void)
     if (is4k && planeHasARGB && planeHasRGB565)
         platform.scanoutFormat = GBM_FORMAT_RGB565;
     // --- END: Harden 4K guard ---
+    // --- BEGIN: Fallback at 4K if plane probe saw nothing usable ---
+    // Sometimes planeHasARGB and planeHasRGB565 remain false on uncommon boards
+    // Ensure we never stick with XRGB at 4K by forcing RGB565 as last resort
+    if (is4k
+        && (platform.scanoutFormat != GBM_FORMAT_RGB565)
+        && !planeHasARGB
+        && !planeHasRGB565)
+    {
+        platform.scanoutFormat = GBM_FORMAT_RGB565;
+        TRACELOG(LOG_WARNING, "DISPLAY: Fallback 4K scanout format to RGB565");
+    }
+    // --- END: Fallback block ---
 
     TRACELOG(LOG_INFO, "DISPLAY: Chosen GBM scanout format: %4.4s (0x%08x)",
             (char*)&platform.scanoutFormat, platform.scanoutFormat);
