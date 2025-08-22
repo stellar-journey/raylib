@@ -1062,7 +1062,6 @@ int InitPlatform(void)
             (char*)&platform.scanoutFormat, platform.scanoutFormat);
     // --- END: Choose scanout format ---
 
-
     platform.gbmDevice = gbm_create_device(platform.fd);
     if (!platform.gbmDevice)
     {
