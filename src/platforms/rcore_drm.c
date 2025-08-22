@@ -1039,6 +1039,15 @@ int InitPlatform(void)
         else if (planeHasARGB)   platform.scanoutFormat = GBM_FORMAT_ARGB8888;
         else if (planeHasRGB565) platform.scanoutFormat = GBM_FORMAT_RGB565;
     }
+
+    // If plane probing failed to find 4K-safe formats and we still have XR24 at 4K, override to AR24 or RG16.
+    if (is4k && (platform.scanoutFormat == GBM_FORMAT_XRGB8888)) {
+        if (planeHasARGB)        platform.scanoutFormat = GBM_FORMAT_ARGB8888;
+        else if (planeHasRGB565) platform.scanoutFormat = GBM_FORMAT_RGB565;
+    }
+
+    // If both AR24 and RG16 are available at 4K, RG16 usually matches fbcon and reduces bandwidth.
+    if (is4k && planeHasARGB && planeHasRGB565) platform.scanoutFormat = GBM_FORMAT_RGB565;
     
     TRACELOG(LOG_INFO, "DISPLAY: Chosen GBM scanout format: %4.4s (0x%08x)",
             (char*)&platform.scanoutFormat, platform.scanoutFormat);
@@ -1052,11 +1061,13 @@ int InitPlatform(void)
         return -1;
     }
 
+    // KV260 primary plane advertises LINEAR only; request LINEAR to avoid implicit tiling
+    uint32_t use_flags = GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR;
     platform.gbmSurface = gbm_surface_create(platform.gbmDevice,
         platform.connector->modes[platform.modeIndex].hdisplay,
         platform.connector->modes[platform.modeIndex].vdisplay,
         platform.scanoutFormat,
-        GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+        use_flags);
     if (!platform.gbmSurface)
     {
         TRACELOG(LOG_WARNING, "DISPLAY: Failed to create GBM surface");
