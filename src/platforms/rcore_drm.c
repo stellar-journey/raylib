@@ -1012,8 +1012,12 @@ int InitPlatform(void)
         for (uint32_t i = 0; i < pres2->count_planes; i++) {
             drmModePlane *pl = drmModeGetPlane(platform.fd, pres2->planes[i]);
             if (!pl) continue;
-            bool forThisCrtc = (crtcIndex >= 0) ? ((pl->possible_crtcs & (1 << crtcIndex)) != 0) : (pl->crtc_id == platform.crtc->crtc_id);
+            bool forThisCrtc =
+                ((crtcIndex >= 0) && ((pl->possible_crtcs & (1 << crtcIndex)) != 0)) ||
+                (pl->crtc_id == platform.crtc->crtc_id);
             if (forThisCrtc) {
+                TRACELOG(LOG_INFO, "DISPLAY: plane %u possible_crtcs=0x%08x crtc_id=%u matches CRTC index %d",
+                    pl->plane_id, pl->possible_crtcs, pl->crtc_id, crtcIndex);
                 for (uint32_t j = 0; j < pl->count_formats; j++) {
                     uint32_t f = pl->formats[j];
                     if (f == DRM_FORMAT_XRGB8888) planeHasXRGB = true;
@@ -1039,15 +1043,6 @@ int InitPlatform(void)
         else if (planeHasARGB)   platform.scanoutFormat = GBM_FORMAT_ARGB8888;
         else if (planeHasRGB565) platform.scanoutFormat = GBM_FORMAT_RGB565;
     }
-
-    // If plane probing failed to find 4K-safe formats and we still have XR24 at 4K, override to AR24 or RG16.
-    if (is4k && (platform.scanoutFormat == GBM_FORMAT_XRGB8888)) {
-        if (planeHasARGB)        platform.scanoutFormat = GBM_FORMAT_ARGB8888;
-        else if (planeHasRGB565) platform.scanoutFormat = GBM_FORMAT_RGB565;
-    }
-
-    // If both AR24 and RG16 are available at 4K, RG16 usually matches fbcon and reduces bandwidth.
-    if (is4k && planeHasARGB && planeHasRGB565) platform.scanoutFormat = GBM_FORMAT_RGB565;
 
     // --- BEGIN: Harden 4K guard to avoid XR24 at 4K ---
     if (is4k && (platform.scanoutFormat == GBM_FORMAT_XRGB8888)) {
