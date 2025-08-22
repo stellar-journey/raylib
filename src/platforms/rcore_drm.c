@@ -1006,25 +1006,35 @@ int InitPlatform(void)
     }
     if (res_idx) drmModeFreeResources(res_idx);
     
-    // Scan plane formats using possible_crtcs (more robust than matching plane->crtc_id)
     drmModePlaneRes *pres2 = drmModeGetPlaneResources(platform.fd);
-    if (pres2) {
-        for (uint32_t i = 0; i < pres2->count_planes; i++) {
+    if (pres2)
+    {
+        for (uint32_t i = 0; i < pres2->count_planes; i++)
+        {
             drmModePlane *pl = drmModeGetPlane(platform.fd, pres2->planes[i]);
             if (!pl) continue;
+
+            // new, robust CRTC test: plane->possible_crtcs OR plane->crtc_id
             bool forThisCrtc =
-                ((crtcIndex >= 0) && ((pl->possible_crtcs & (1 << crtcIndex)) != 0)) ||
-                (pl->crtc_id == platform.crtc->crtc_id);
-            if (forThisCrtc) {
-                TRACELOG(LOG_INFO, "DISPLAY: plane %u possible_crtcs=0x%08x crtc_id=%u matches CRTC index %d",
-                    pl->plane_id, pl->possible_crtcs, pl->crtc_id, crtcIndex);
-                for (uint32_t j = 0; j < pl->count_formats; j++) {
+                ((crtcIndex >= 0) && ((pl->possible_crtcs & (1 << crtcIndex)) != 0))
+                || (pl->crtc_id == platform.crtc->crtc_id);
+
+            if (forThisCrtc)
+            {
+                for (uint32_t j = 0; j < pl->count_formats; j++)
+                {
                     uint32_t f = pl->formats[j];
-                    if (f == DRM_FORMAT_XRGB8888) planeHasXRGB = true;
-                    if (f == DRM_FORMAT_ARGB8888) planeHasARGB = true;
+                    if (f == DRM_FORMAT_XRGB8888) planeHasXRGB  = true;
+                    if (f == DRM_FORMAT_ARGB8888) planeHasARGB  = true;
                     if (f == DRM_FORMAT_RGB565)   planeHasRGB565 = true;
                 }
+                TRACELOG(LOG_INFO, "DISPLAY: plane %u matches CRTC, formats -> XRGB:%s ARGB:%s RGB565:%s",
+                         pl->plane_id,
+                         planeHasXRGB  ? "yes":"no",
+                         planeHasARGB  ? "yes":"no",
+                         planeHasRGB565? "yes":"no");
             }
+
             drmModeFreePlane(pl);
         }
         drmModeFreePlaneResources(pres2);
@@ -1050,7 +1060,8 @@ int InitPlatform(void)
         else if (planeHasARGB)   platform.scanoutFormat = GBM_FORMAT_ARGB8888;
     }
     // If both AR24 and RG16 are available at 4K, prefer RG16 (matches fbcon)
-    if (is4k && planeHasARGB && planeHasRGB565) platform.scanoutFormat = GBM_FORMAT_RGB565;
+    if (is4k && planeHasARGB && planeHasRGB565)
+        platform.scanoutFormat = GBM_FORMAT_RGB565;
     // --- END: Harden 4K guard ---
 
     TRACELOG(LOG_INFO, "DISPLAY: Chosen GBM scanout format: %4.4s (0x%08x)",
