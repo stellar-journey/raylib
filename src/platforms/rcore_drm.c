@@ -1036,12 +1036,32 @@ int InitPlatform(void)
             drmModePlane *pl = drmModeGetPlane(platform.fd, pres2->planes[i]);
             if (!pl) continue;
 
-            // new, robust CRTC test: plane->possible_crtcs OR plane->crtc_id
+            // Must be attached to our CRTC (possible_crtcs OR crtc_id)
             bool forThisCrtc =
-                ((crtcIndex >= 0) && ((pl->possible_crtcs & (1 << crtcIndex)) != 0))
-                || (pl->crtc_id == platform.crtc->crtc_id);
+                ((crtcIndex >= 0) && ((pl->possible_crtcs & (1 << crtcIndex)) != 0)) ||
+                (pl->crtc_id == platform.crtc->crtc_id);
 
-            if (forThisCrtc)
+            // Only inspect the *primary* plane, not overlays or cursors.
+            bool isPrimaryPlane = false;
+            drmModeObjectProperties *props =
+                drmModeObjectGetProperties(platform.fd, pl->plane_id, DRM_MODE_OBJECT_PLANE);
+            if (props)
+            {
+                for (uint32_t p = 0; p < props->count_props; p++)
+                {
+                    drmModePropertyRes *prop =
+                        drmModeGetProperty(platform.fd, props->props[p]);
+                    if (prop && !strcmp(prop->name, "type") &&
+                        props->prop_values[p] == DRM_PLANE_TYPE_PRIMARY)
+                    {
+                        isPrimaryPlane = true;
+                    }
+                    if (prop) drmModeFreeProperty(prop);
+                }
+                drmModeFreeObjectProperties(props);
+            }
+
+            if (forThisCrtc && isPrimaryPlane)
             {
                 for (uint32_t j = 0; j < pl->count_formats; j++)
                 {
@@ -1050,7 +1070,7 @@ int InitPlatform(void)
                     if (f == DRM_FORMAT_ARGB8888) planeHasARGB  = true;
                     if (f == DRM_FORMAT_RGB565)   planeHasRGB565 = true;
                 }
-                TRACELOG(LOG_INFO, "DISPLAY: plane %u matches CRTC, formats -> XRGB:%s ARGB:%s RGB565:%s",
+                TRACELOG(LOG_INFO, "DISPLAY: primary plane %u formats -> XRGB:%s ARGB:%s RGB565:%s",
                          pl->plane_id,
                          planeHasXRGB  ? "yes":"no",
                          planeHasARGB  ? "yes":"no",
