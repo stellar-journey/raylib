@@ -250,23 +250,22 @@ static void page_flip_handler(int fd, unsigned int sequence,
                               void *user_data)
 {
     (void)fd; (void)sequence; (void)tv_sec; (void)tv_usec; (void)user_data;
+    TRACELOG(LOG_DEBUG, "DISPLAY: page_flip_handler() start");
 
-    // Free the previous framebuffer
     if (platform.prevFB)
     {
-        TRACELOG(LOG_DEBUG, "DISPLAY: page_flip_handler freeing FB %u", platform.prevFB);
-        int r = drmModeRmFB(platform.fd, platform.prevFB);
-        if (r) TRACELOG(LOG_WARNING, "DISPLAY: drmModeRmFB() failed: %d", r);
+        TRACELOG(LOG_DEBUG, "DISPLAY:   freeing FB=%u", platform.prevFB);
+        drmModeRmFB(platform.fd, platform.prevFB);
         platform.prevFB = 0;
     }
-    // Release the old GBM BO
     if (platform.prevBO)
     {
-        TRACELOG(LOG_DEBUG, "DISPLAY: page_flip_handler releasing BO %p", platform.prevBO);
+        TRACELOG(LOG_DEBUG, "DISPLAY:   releasing BO=%p", platform.prevBO);
         gbm_surface_release_buffer(platform.gbmSurface, platform.prevBO);
         platform.prevBO = NULL;
     }
-    TRACELOG(LOG_DEBUG, "DISPLAY: page_flip event handled");
+
+    TRACELOG(LOG_DEBUG, "DISPLAY: page_flip_handler() done");
 }
 
 //----------------------------------------------------------------------------------
@@ -582,9 +581,18 @@ void SwapScreenBuffer(void)
     if (!platform.gbmSurface || (-1 == platform.fd) || !platform.connector || !platform.crtc)
         TRACELOG(LOG_ERROR, "DISPLAY: DRM initialization failed to swap");
 
+    // --- BEGIN BO TRACE: lock front buffer ---
+    TRACELOG(LOG_TRACE, "DISPLAY: about to lock front GBM BO");
+    
     struct gbm_bo *bo = gbm_surface_lock_front_buffer(platform.gbmSurface);
     if (!bo) TRACELOG(LOG_ERROR, "DISPLAY: Failed GBM to lock front buffer");
-    
+
+    // --- END BO TRACE ---
+    TRACELOG(LOG_TRACE, "DISPLAY: locked GBM BO %p", bo);
+    uint32_t boStride   = gbm_bo_get_stride(bo);
+    uint64_t boModifier = gbm_bo_get_modifier(bo);
+    TRACELOG(LOG_TRACE, "DISPLAY:   BO stride=%u, modifier=0x%llx", boStride, boModifier);
+
     uint32_t fb = 0;
     uint32_t handles[4] = { gbm_bo_get_handle(bo).u32, 0, 0, 0 };
     uint32_t pitches[4] = { (uint32_t)gbm_bo_get_stride(bo), 0, 0, 0 };
@@ -647,15 +655,15 @@ void SwapScreenBuffer(void)
     if (result != 0)
         TRACELOG(LOG_ERROR, "DISPLAY: drmModeAddFB2[WithModifiers]() failed: %d", result);
 
-    // --- BEGIN: TRACE the FB handle from AddFB2 ---
-    TRACELOG(LOG_INFO, "DISPLAY: addfb2 result=%d -> FB=%u", result, fb);
+        // --- BEGIN FB TRACE ---
+    TRACELOG(LOG_TRACE, "DISPLAY: after AddFB2, result=%d -> fbHandle=%u", result, fb);
     if (result != 0 || fb == 0)
     {
-        TRACELOG(LOG_ERROR, "DISPLAY: invalid FB (%u) or addfb2 error (%d), aborting SwapScreenBuffer", fb, result);
+        TRACELOG(LOG_ERROR, "DISPLAY: invalid FB (%u) or addfb2 failure, releasing BO and aborting", fb);
         gbm_surface_release_buffer(platform.gbmSurface, bo);
         return;
     }
-    // --- END: Validate FB before modeset/flip ---
+    // --- END FB TRACE ---
     
     // Perform a one-time modeset, then flip on subsequent frames.
     static bool s_crtc_set = false;
@@ -700,7 +708,10 @@ void SwapScreenBuffer(void)
         }
         TRACELOG(LOG_TRACE, "DISPLAY: drained %d pending page-flip events", drained);
 
-        TRACELOG(LOG_TRACE, "DISPLAY: queuing page-flip for FB %u on CRTC %u", fb, platform.crtc->crtc_id);
+        // --- BEGIN pageflip TRACE ---
+        TRACELOG(LOG_TRACE, "DISPLAY: queuing page-flip fb=%u on crtc=%u",
+                 fb, platform.crtc->crtc_id);
+        
         // Queue the next page-flip; now guaranteed not to return -EBUSY
         result = drmModePageFlip(platform.fd,
                                  platform.crtc->crtc_id,
