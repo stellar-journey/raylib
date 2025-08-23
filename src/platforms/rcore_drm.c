@@ -218,6 +218,9 @@ static const short linuxToRaylibMap[KEYMAP_SIZE] = {
     [BTN_THUMBR] = GAMEPAD_BUTTON_RIGHT_THUMB,
 };
 
+// Flip pipeline state: set when drmModePageFlip is queued, cleared in page_flip_handler
+static volatile int g_flipPending = 0;
+
 //----------------------------------------------------------------------------------
 // Module Internal Functions Declaration
 //----------------------------------------------------------------------------------
@@ -249,6 +252,9 @@ static void page_flip_handler(int fd, unsigned int sequence,
                               unsigned int tv_sec, unsigned int tv_usec,
                               void *user_data)
 {
+    // Mark flip completed
+    g_flipPending = 0;
+
     (void)fd; (void)sequence; (void)tv_sec; (void)tv_usec; (void)user_data;
     TRACELOG(LOG_DEBUG, "DISPLAY: page_flip_handler() start");
 
@@ -694,6 +700,26 @@ void SwapScreenBuffer(void)
     }
     else
     {
+    
+        // If a previous flip is still pending, wait briefly for the event before queuing a new flip.
+        if (g_flipPending)
+        {
+            struct pollfd pfd = { .fd = platform.fd, .events = POLLIN, .revents = 0 };
+            // Wait up to ~50ms total in small slices to avoid long stalls
+            for (int waits = 0; g_flipPending && waits < 5; waits++)
+            {
+                int pr = poll(&pfd, 1, 10);
+                if (pr > 0 && (pfd.revents & POLLIN))
+                {
+                    drmEventContext evctx;
+                    memset(&evctx, 0, sizeof(evctx));
+                    evctx.version           = 2;
+                    evctx.page_flip_handler = page_flip_handler;
+                    drmHandleEvent(platform.fd, &evctx);
+                }
+            }
+        }
+
         // Drain all pending page-flip events so next flip never EBUSYs
         struct pollfd pfd = { .fd = platform.fd, .events = POLLIN, .revents = 0 };
         int drained = 0;
@@ -723,6 +749,9 @@ void SwapScreenBuffer(void)
             TRACELOG(LOG_ERROR, "DISPLAY: drmModePageFlip() failed: %d", result);
             return;
         }
+        // Mark flip as pending; will be cleared in page_flip_handler
+        g_flipPending = 1;
+
         TRACELOG(LOG_TRACE, "DISPLAY: page-flip queued OK");
     }
 
