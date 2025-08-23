@@ -647,6 +647,16 @@ void SwapScreenBuffer(void)
     if (result != 0)
         TRACELOG(LOG_ERROR, "DISPLAY: drmModeAddFB2[WithModifiers]() failed: %d", result);
 
+    // --- BEGIN: TRACE the FB handle from AddFB2 ---
+    TRACELOG(LOG_INFO, "DISPLAY: addfb2 result=%d -> FB=%u", result, fb);
+    if (result != 0 || fb == 0)
+    {
+        TRACELOG(LOG_ERROR, "DISPLAY: invalid FB (%u) or addfb2 error (%d), aborting SwapScreenBuffer", fb, result);
+        gbm_surface_release_buffer(platform.gbmSurface, bo);
+        return;
+    }
+    // --- END: Validate FB before modeset/flip ---
+    
     // Perform a one-time modeset, then flip on subsequent frames.
     static bool s_crtc_set = false;
 
