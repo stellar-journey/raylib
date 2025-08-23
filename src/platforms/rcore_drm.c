@@ -649,12 +649,10 @@ void SwapScreenBuffer(void)
 
     // Perform a one-time modeset, then flip on subsequent frames.
     static bool s_crtc_set = false;
-
     if (!s_crtc_set)
     {
-        // Use the chosen connector/mode from InitPlatform()
+        // One-time CRTC modeset: use the probed connector & modeIndex
         drmModeModeInfo *modeInfo = &platform.connector->modes[platform.modeIndex];
-
         result = drmModeSetCrtc(platform.fd,
                                 platform.crtc->crtc_id,
                                 fb,
@@ -667,22 +665,23 @@ void SwapScreenBuffer(void)
             TRACELOG(LOG_ERROR, "DISPLAY: drmModeSetCrtc() failed: %d", result);
             return;
         }
-
         s_crtc_set = true;
     }
     else
     {
-        // Drain all pending page-flip events so next flip won't return EBUSY
+        // Drain *all* pending flip events so drmModePageFlip() never EBUSYs
         struct pollfd pfd = { .fd = platform.fd, .events = POLLIN, .revents = 0 };
         while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN))
         {
-            drmEventContext evctx = { 0 };
-            evctx.version           = DRM_EVENT_CONTEXT_VERSION;
+            // Use explicit version=2 to avoid undeclared DRM_EVENT_CONTEXT_VERSION
+            drmEventContext evctx;
+            memset(&evctx, 0, sizeof(evctx));
+            evctx.version           = 2;
             evctx.page_flip_handler = page_flip_handler;
             drmHandleEvent(platform.fd, &evctx);
         }
 
-        // Queue the next page-flip (now guaranteed not EBUSY)
+        // Queue the next page-flip; now guaranteed not to return -EBUSY
         result = drmModePageFlip(platform.fd,
                                  platform.crtc->crtc_id,
                                  fb,
@@ -695,7 +694,7 @@ void SwapScreenBuffer(void)
         }
     }
 
-    // Save this FB/BO for cleanup inside page_flip_handler()
+    // Save this FB/BO so page_flip_handler() can free it on event
     platform.prevFB = fb;
     platform.prevBO = bo;
 }
