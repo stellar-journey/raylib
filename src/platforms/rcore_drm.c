@@ -649,39 +649,40 @@ void SwapScreenBuffer(void)
 
     // Perform a one-time modeset, then flip on subsequent frames.
     static bool s_crtc_set = false;
+
     if (!s_crtc_set)
     {
+        // Use the chosen connector/mode from InitPlatform()
+        drmModeModeInfo *modeInfo = &platform.connector->modes[platform.modeIndex];
+
         result = drmModeSetCrtc(platform.fd,
                                 platform.crtc->crtc_id,
                                 fb,
                                 0, 0,
                                 &platform.connector->connector_id,
                                 1,
-                                &platform.mode);
+                                modeInfo);
         if (result)
         {
             TRACELOG(LOG_ERROR, "DISPLAY: drmModeSetCrtc() failed: %d", result);
-            // Early out on failure so we don't set s_crtc_set
             return;
         }
+
         s_crtc_set = true;
     }
     else
     {
-        // Save old buffers so we can release them after the flip
-        struct gbm_bo *prevBo = platform.prevBO;
-        uint32_t prevFb       = platform.prevFB;
+        // Drain all pending page-flip events so next flip won't return EBUSY
+        struct pollfd pfd = { .fd = platform.fd, .events = POLLIN, .revents = 0 };
+        while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN))
+        {
+            drmEventContext evctx = { 0 };
+            evctx.version           = DRM_EVENT_CONTEXT_VERSION;
+            evctx.page_flip_handler = page_flip_handler;
+            drmHandleEvent(platform.fd, &evctx);
+        }
 
-        // Prepare for page-flip events
-        struct drm_event_context evctx = {
-            .version          = DRM_EVENT_CONTEXT_VERSION,
-            .page_flip_handler = pageFlipHandler,
-        };
-
-        // Drain any pending events to avoid fd overload
-        while (drmHandleEvent(platform.fd, &evctx) == 0);
-
-        // Request page flip
+        // Queue the next page-flip (now guaranteed not EBUSY)
         result = drmModePageFlip(platform.fd,
                                  platform.crtc->crtc_id,
                                  fb,
@@ -692,13 +693,9 @@ void SwapScreenBuffer(void)
             TRACELOG(LOG_ERROR, "DISPLAY: drmModePageFlip() failed: %d", result);
             return;
         }
-
-        // Now safe to release the old FB/BO
-        if (prevFb) drmModeRmFB(platform.fd, prevFb);
-        if (prevBo) gbm_surface_release_buffer(platform.gbmSurface, prevBo);
     }
 
-    // Store current buffer for release on next flip
+    // Save this FB/BO for cleanup inside page_flip_handler()
     platform.prevFB = fb;
     platform.prevBO = bo;
 }
