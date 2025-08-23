@@ -651,32 +651,24 @@ void SwapScreenBuffer(void)
             platform.prevBO = NULL;
         }
     } else {
-        // Queue a page flip and process the flip event non-blocking.
-        result = drmModePageFlip(platform.fd, platform.crtc->crtc_id, fb,
-                                 DRM_MODE_PAGE_FLIP_EVENT, NULL);
-        if (result != 0) TRACELOG(LOG_ERROR, "DISPLAY: drmModePageFlip() failed: %d", result);
-        
-        // Drain any pending page flip events without stalling the loop.
+        // Drain all pending page-flip events first, so next flip isn't busy
         struct pollfd pfd = { .fd = platform.fd, .events = POLLIN, .revents = 0 };
-        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN))
+        while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN))
         {
             drmEventContext ev = {
-                .version           = 2,               // DRM event API version
+                .version           = 2,
                 .page_flip_handler = page_flip_handler
             };
             drmHandleEvent(platform.fd, &ev);
         }
-        
-        // Now release the previously displayed FB/BO.
-        if (platform.prevFB) {
-            int r = drmModeRmFB(platform.fd, platform.prevFB);
-            if (r != 0) TRACELOG(LOG_ERROR, "DISPLAY: drmModeRmFB() failed with result: %d", r);
-            platform.prevFB = 0;
-        }
-        if (platform.prevBO) {
-            gbm_surface_release_buffer(platform.gbmSurface, platform.prevBO);
-            platform.prevBO = NULL;
-        }
+    
+        // Now queue the next page-flip; it cannot return EBUSY because no flip is pending
+        result = drmModePageFlip(platform.fd, platform.crtc->crtc_id, fb,
+                                 DRM_MODE_PAGE_FLIP_EVENT, NULL);
+        if (result != 0)
+            TRACELOG(LOG_ERROR, "DISPLAY: drmModePageFlip() failed: %d", result);
+    
+        // Defer FB/BO cleanup to the page_flip_handler callback
     }
     
     platform.prevFB = fb;
