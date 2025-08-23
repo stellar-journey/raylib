@@ -243,15 +243,30 @@ static int FindPreferredConnectorMode(const drmModeConnector *connector);       
 static int FindExactSizeConnectorMode(const drmModeConnector *connector, uint width, uint height, bool allowInterlaced);            // Exact WxH ignoring fps
 
 //----------------------------------------------------------------------------------
-// Page-flip event handler: consumes events so the next flip won't return -EBUSY
+// Page-flip event handler: free the old FB and BO, then consume the event
 //----------------------------------------------------------------------------------
 static void page_flip_handler(int fd, unsigned int sequence,
                               unsigned int tv_sec, unsigned int tv_usec,
                               void *user_data)
 {
     (void)fd; (void)sequence; (void)tv_sec; (void)tv_usec; (void)user_data;
-    // No-op: we just need to process the event to clear the pending flip
-    TRACELOG(LOG_INFO, "DISPLAY: page_flip event handled");
+
+    // Free the previous framebuffer on the CRTC
+    if (platform.prevFB)
+    {
+        int r = drmModeRmFB(platform.fd, platform.prevFB);
+        if (r != 0) TRACELOG(LOG_WARNING, "DISPLAY: drmModeRmFB() failed: %d", r);
+        platform.prevFB = 0;
+    }
+
+    // Release the old GBM BO back to the surface
+    if (platform.prevBO)
+    {
+        gbm_surface_release_buffer(platform.gbmSurface, platform.prevBO);
+        platform.prevBO = NULL;
+    }
+
+    TRACELOG(LOG_DEBUG, "DISPLAY: page_flip event handled, resources freed");
 }
 
 //----------------------------------------------------------------------------------
