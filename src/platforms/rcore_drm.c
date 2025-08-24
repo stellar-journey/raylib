@@ -591,10 +591,14 @@ void SwapScreenBuffer(void)
     TRACELOG(LOG_TRACE, "DISPLAY: about to lock front GBM BO");
     
     struct gbm_bo *bo = gbm_surface_lock_front_buffer(platform.gbmSurface);
-    if (!bo) TRACELOG(LOG_ERROR, "DISPLAY: Failed GBM to lock front buffer");
-
+    if (!bo) {
+        TRACELOG(LOG_ERROR, "DISPLAY: Failed GBM to lock front buffer");
+        // NOTE: Without a front buffer we cannot form a FB; bail out cleanly to avoid segfault.
+        return;
+    }
     // --- END BO TRACE ---
     TRACELOG(LOG_TRACE, "DISPLAY: locked GBM BO %p", bo);
+
     uint32_t boStride   = gbm_bo_get_stride(bo);
     uint64_t boModifier = gbm_bo_get_modifier(bo);
     TRACELOG(LOG_TRACE, "DISPLAY:   BO stride=%u, modifier=0x%llx", boStride, boModifier);
@@ -695,7 +699,21 @@ void SwapScreenBuffer(void)
         }
         TRACELOG(LOG_INFO, "DISPLAY: one-time drmModeSetCrtc() succeeded for FB %u on CRTC %u",
                  fb, platform.crtc->crtc_id);
-        
+
+        // Force connector DPMS to On (0) if supported to avoid spurious blanks on bring-up
+        drmModeObjectProperties *cprops =
+            drmModeObjectGetProperties(platform.fd, platform.connector->connector_id, DRM_MODE_OBJECT_CONNECTOR);
+        if (cprops) {
+            for (uint32_t pi = 0; pi < cprops->count_props; pi++) {
+                drmModePropertyRes *prop = drmModeGetProperty(platform.fd, cprops->props[pi]);
+                if (prop && prop->name && strcmp(prop->name, "DPMS") == 0) {
+                    drmModeConnectorSetProperty(platform.fd, platform.connector->connector_id, prop->prop_id, 0);
+                    TRACELOG(LOG_TRACE, "DISPLAY: DPMS property set to On");
+                }
+                if (prop) drmModeFreeProperty(prop);
+            }
+            drmModeFreeObjectProperties(cprops);
+        }
         s_crtc_set = true;
     }
     else
@@ -733,22 +751,40 @@ void SwapScreenBuffer(void)
             drained++;
         }
         TRACELOG(LOG_TRACE, "DISPLAY: drained %d pending page-flip events", drained);
-
-        // --- BEGIN pageflip TRACE ---
-        TRACELOG(LOG_TRACE, "DISPLAY: queuing page-flip fb=%u on crtc=%u",
-                 fb, platform.crtc->crtc_id);
         
-        // Queue the next page-flip; now guaranteed not to return -EBUSY
-        result = drmModePageFlip(platform.fd,
-                                 platform.crtc->crtc_id,
-                                 fb,
-                                 DRM_MODE_PAGE_FLIP_EVENT,
-                                 NULL);
-        if (result)
-        {
+        result = drmModePageFlip(platform.fd, platform.crtc->crtc_id, fb, DRM_MODE_PAGE_FLIP_EVENT, NULL);
+        if (result) {
             TRACELOG(LOG_ERROR, "DISPLAY: drmModePageFlip() failed: %d", result);
-            return;
+            
+            // If the CRTC is busy with a prior flip, drain events and retry once.
+            if (result == -EBUSY) {
+                TRACELOG(LOG_TRACE, "DISPLAY: page-flip EBUSY, draining events then retrying once");
+                struct pollfd pfd2 = { .fd = platform.fd, .events = POLLIN, .revents = 0 };
+                for (int waits = 0; waits < 5; waits++) {
+                    int pr = poll(&pfd2, 1, 10);
+                    if (pr > 0 && (pfd2.revents & POLLIN)) {
+                        drmEventContext evctx;
+                        memset(&evctx, 0, sizeof(evctx));
+                        evctx.version = 2;
+                        evctx.page_flip_handler = page_flip_handler;
+                        drmHandleEvent(platform.fd, &evctx);
+                        if (!g_flipPending) break;
+                    }
+                }
+                // Retry once
+                result = drmModePageFlip(platform.fd, platform.crtc->crtc_id, fb, DRM_MODE_PAGE_FLIP_EVENT, NULL);
+            }
+            
+            if (result) {
+                TRACELOG(LOG_ERROR, "DISPLAY: drmModePageFlip() still failing (%d); removing FB and releasing BO", result);
+                // IMPORTANT: Cleanup the just-created FB/BO to avoid leaving the GBM surface stuck
+                if (fb) drmModeRmFB(platform.fd, fb);
+                if (bo) gbm_surface_release_buffer(platform.gbmSurface, bo);
+                // Do NOT modify platform.prev* here; caller-visible scanout remains unchanged.
+                return;
+            }
         }
+        
         // Mark flip as pending; will be cleared in page_flip_handler
         g_flipPending = 1;
 
