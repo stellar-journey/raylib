@@ -220,6 +220,8 @@ static const short linuxToRaylibMap[KEYMAP_SIZE] = {
 
 // Flip pipeline state: set when drmModePageFlip is queued, cleared in page_flip_handler
 static volatile int g_flipPending = 0;
+// Count consecutive EBUSY flips (helps observability and optional policy)
+static int g_flipBusyStreak = 0;
 
 //----------------------------------------------------------------------------------
 // Module Internal Functions Declaration
@@ -699,6 +701,7 @@ void SwapScreenBuffer(void)
         }
         TRACELOG(LOG_INFO, "DISPLAY: one-time drmModeSetCrtc() succeeded for FB %u on CRTC %u",
                  fb, platform.crtc->crtc_id);
+        g_flipBusyStreak = 0;
 
         // Force connector DPMS to On (0) if supported to avoid spurious blanks on bring-up
         drmModeObjectProperties *cprops =
@@ -774,20 +777,45 @@ void SwapScreenBuffer(void)
                 // Retry once
                 result = drmModePageFlip(platform.fd, platform.crtc->crtc_id, fb, DRM_MODE_PAGE_FLIP_EVENT, NULL);
             }
-            
+
             if (result) {
-                TRACELOG(LOG_ERROR, "DISPLAY: drmModePageFlip() still failing (%d); removing FB and releasing BO", result);
-                // IMPORTANT: Cleanup the just-created FB/BO to avoid leaving the GBM surface stuck
+                // Page-flip still not accepted; try a one-shot present with drmModeSetCrtc()
+                TRACELOG(LOG_INFO, "DISPLAY: PageFlip failed (%d); falling back to drmModeSetCrtc for this frame", result);
+    
+                drmModeModeInfo *modeInfo2 = &platform.connector->modes[platform.modeIndex];
+                int r2 = drmModeSetCrtc(platform.fd,
+                                        platform.crtc->crtc_id,
+                                        fb,
+                                        0, 0,
+                                        &platform.connector->connector_id,
+                                        1,
+                                        modeInfo2);
+    
+                if (r2 == 0) {
+                    // We latched the new FB via modeset; free the previously-displayed frame now.
+                    if (platform.prevFB) { drmModeRmFB(platform.fd, platform.prevFB); platform.prevFB = 0; }
+                    if (platform.prevBO) { gbm_surface_release_buffer(platform.gbmSurface, platform.prevBO); platform.prevBO = NULL; }
+    
+                    platform.prevFB = fb;
+                    platform.prevBO = bo;
+    
+                    // Not waiting on any flip event now
+                    g_flipPending = 0;
+                    if (g_flipBusyStreak < 100) g_flipBusyStreak++;
+                    return;
+                }
+    
+                // Fallback modeset also failed; drop the new frame cleanly and keep scanout unchanged
+                TRACELOG(LOG_ERROR, "DISPLAY: drmModeSetCrtc() fallback failed: %d; dropping new FB", r2);
                 if (fb) drmModeRmFB(platform.fd, fb);
                 if (bo) gbm_surface_release_buffer(platform.gbmSurface, bo);
-                // Do NOT modify platform.prev* here; caller-visible scanout remains unchanged.
                 return;
             }
         }
         
         // Mark flip as pending; will be cleared in page_flip_handler
         g_flipPending = 1;
-
+        g_flipBusyStreak = 0;
         TRACELOG(LOG_TRACE, "DISPLAY: page-flip queued OK");
     }
 
