@@ -779,6 +779,7 @@ void SwapScreenBuffer(void)
             }
 
             if (result) {
+                // TEMPORARY: legacy flip fallback to keep scanout alive; replace with atomic commit in future migration
                 // Page-flip still not accepted; try a one-shot present with drmModeSetCrtc()
                 TRACELOG(LOG_INFO, "DISPLAY: PageFlip failed (%d); falling back to drmModeSetCrtc for this frame", result);
     
